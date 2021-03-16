@@ -505,6 +505,34 @@ func ApplyTraits(r Role, traits map[string][]string) Role {
 		if inLabels != nil {
 			r.SetDatabaseLabels(condition, applyLabelsTraits(inLabels, traits))
 		}
+
+		// apply templates to impersonation conditions
+		inCond := r.GetImpersonateConditions(condition)
+		var outCond types.ImpersonateConditions
+		for _, user := range inCond.Users {
+			variableValues, err := applyValueTraits(user, traits)
+			if err != nil {
+				if !trace.IsNotFound(err) {
+					log.WithError(err).Debugf("Skipping impersonate user %q.", user)
+				}
+				continue
+			}
+			outCond.Users = append(outCond.Users, variableValues...)
+		}
+		for _, role := range inCond.Roles {
+			variableValues, err := applyValueTraits(role, traits)
+			if err != nil {
+				if !trace.IsNotFound(err) {
+					log.WithError(err).Debugf("Skipping impersonate role %q.", role)
+				}
+				continue
+			}
+			outCond.Roles = append(outCond.Roles, variableValues...)
+		}
+		outCond.Users = utils.Deduplicate(outCond.Users)
+		outCond.Roles = utils.Deduplicate(outCond.Roles)
+		outCond.Where = inCond.Where
+		r.SetImpersonateConditions(condition, outCond)
 	}
 
 	return r
@@ -810,6 +838,13 @@ type AccessChecker interface {
 	// CheckAccessToDatabase checks whether a user has access to the provided
 	// database server.
 	CheckAccessToDatabase(server types.DatabaseServer, mfaVerified bool, matchers ...RoleMatcher) error
+
+	// CheckImpersonate checks whether current user is allowed to impersonate
+	// users and roles
+	CheckImpersonate(currentUser, impersonateUser types.User, impersonateRoles []types.Role) error
+
+	// CanImpersonateSomeone returns true if this checker has any impersonation rules
+	CanImpersonateSomeone() bool
 }
 
 // FromSpec returns new RoleSet created from spec
@@ -1558,6 +1593,152 @@ func (set RoleSet) CheckAccessToKubernetes(namespace string, kube *KubernetesClu
 	return trace.AccessDenied("access to kubernetes cluster denied")
 }
 
+// CanImpersonateSomeone returns true if this checker has any impersonation rules
+func (set RoleSet) CanImpersonateSomeone() bool {
+	for _, role := range set {
+		cond := role.GetImpersonateConditions(Allow)
+		if !cond.IsEmpty() {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckImpersonate returns nil if this role set can impersonate
+// a user and their roles, returns AccessDenied otherwise
+// CheckImpersonate checks whether current user is allowed to impersonate
+// users and roles
+func (set RoleSet) CheckImpersonate(currentUser, impersonateUser types.User, impersonateRoles []types.Role) error {
+	ctx := &impersonateContext{
+		user:            currentUser,
+		impersonateUser: impersonateUser,
+	}
+	whereParser, err := newImpersonateWhereParser(ctx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// check deny: a single match on a deny rule prohibits access
+	for _, role := range set {
+		cond := role.GetImpersonateConditions(Deny)
+		matched, err := matchDenyImpersonateCondition(cond, impersonateUser, impersonateRoles)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		if matched {
+			return trace.AccessDenied("access denied to '%s' to impersonate user '%s' and roles '%s'", currentUser.GetName(), impersonateUser.GetName(), roleNames(impersonateRoles))
+		}
+	}
+
+	// check allow: if matches, allow to impersonate
+	for _, role := range set {
+		cond := role.GetImpersonateConditions(Allow)
+		matched, err := matchAllowImpersonateCondition(ctx, whereParser, cond, impersonateUser, impersonateRoles)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		if matched {
+			return nil
+		}
+	}
+
+	return trace.AccessDenied("access denied to '%s' to impersonate user '%s' and roles '%s'", currentUser.GetName(), impersonateUser.GetName(), roleNames(impersonateRoles))
+}
+
+func roleNames(roles []types.Role) string {
+	out := make([]string, len(roles))
+	for i := range roles {
+		out[i] = roles[i].GetName()
+	}
+	return strings.Join(out, ", ")
+}
+
+// matchAllowImpersonateCondition matches impersonate condition,
+// both user, role and where condition has to match
+func matchAllowImpersonateCondition(ctx *impersonateContext, whereParser predicate.Parser, cond types.ImpersonateConditions, impersonateUser types.User, impersonateRoles []types.Role) (bool, error) {
+	// an empty set matches nothing
+	if len(cond.Users) == 0 && len(cond.Roles) == 0 {
+		return false, nil
+	}
+	// should specify both roles and users, this condition is also verified on the role level
+	if len(cond.Users) == 0 || len(cond.Roles) == 0 {
+		return false, trace.BadParameter("the system does not support empty roles and users")
+	}
+
+	if !newMatcherFn(cond.Users)(impersonateUser.GetName()) {
+		return false, nil
+	}
+
+	roleMatch := newMatcherFn(cond.Roles)
+	for _, impersonateRole := range impersonateRoles {
+		if !roleMatch(impersonateRole.GetName()) {
+			return false, nil
+		}
+		// TODO:
+		// This set impersonateRole inside the ctx that is in turn used inside whereParser
+		// which is created in CheckImpersonate above but is being used right below.
+		// This is unfortunate interface of the parser, instead
+		// parser should accept additional context as a first argument.
+		ctx.impersonateRole = impersonateRole
+		match, err := matchesImpersonateWhere(cond, whereParser)
+		if err != nil {
+			return false, trace.Wrap(err)
+		}
+		if !match {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// matchDenyImpersonateCondition matches impersonate condition,
+// greedy is used for deny type rules, where any user or role can match
+func matchDenyImpersonateCondition(cond types.ImpersonateConditions, impersonateUser types.User, impersonateRoles []types.Role) (bool, error) {
+	// an empty set matches nothing
+	if len(cond.Users) == 0 && len(cond.Roles) == 0 {
+		return false, nil
+	}
+	// should specify both roles and users, this condition is also verified on the role level
+	if len(cond.Users) == 0 || len(cond.Roles) == 0 {
+		return false, trace.BadParameter("the system does not support empty roles and users")
+	}
+
+	if newMatcherFn(cond.Users)(impersonateUser.GetName()) {
+		return true, nil
+	}
+
+	roleMatch := newMatcherFn(cond.Roles)
+	for _, impersonateRole := range impersonateRoles {
+		if roleMatch(impersonateRole.GetName()) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// newMatcherFn returns a matcher function based
+// on incoming values - if there is a wildcard matcher
+// present, it returns a wildcard matcher
+func newMatcherFn(in []string) func(in string) bool {
+	var set map[string]struct{}
+	for _, v := range in {
+		// there is no need to build a set if there is a wildcard
+		if v == Wildcard {
+			return matchAny
+		}
+		if set == nil {
+			set = make(map[string]struct{}, len(in))
+		}
+		set[v] = struct{}{}
+	}
+	return func(in string) bool { _, ok := set[in]; return ok }
+}
+
+func matchAny(_ string) bool {
+	return true
+}
+
 // RoleMatcher defines an interface for a generic role matcher.
 type RoleMatcher interface {
 	Match(Role, RoleConditionType) (bool, error)
@@ -1990,6 +2171,23 @@ const RoleSpecV3SchemaDefinitions = `
 					}
 				  }
 				}
+			  }
+			}
+		  },
+		  "impersonate": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+			  "users": {
+				"type": "array",
+				"items": { "type": "string" }
+			  },
+			  "roles": {
+				"type": "array",
+				"items": { "type": "string" }
+			  },
+			  "where": {
+			    "type": "string"
 			  }
 			}
 		  },
