@@ -531,6 +531,9 @@ func (r *DeleteWebTokenRequest) Check() error {
 }
 
 // IntoMap makes this filter into a map.
+//
+// This filter is used with the cache watcher to make sure only sessions
+// for a particular user are returned.
 func (f *WebSessionFilter) IntoMap() map[string]string {
 	m := make(map[string]string)
 	if f.User != "" {
@@ -540,6 +543,9 @@ func (f *WebSessionFilter) IntoMap() map[string]string {
 }
 
 // FromMap converts provided map into this filter.
+//
+// This filter is used with the cache watcher to make sure only sessions
+// for a particular user are returned.
 func (f *WebSessionFilter) FromMap(m map[string]string) error {
 	for key, val := range m {
 		switch key {

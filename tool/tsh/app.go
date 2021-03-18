@@ -18,7 +18,9 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"text/template"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
@@ -63,12 +65,18 @@ func onAppLogin(cf *CLIConf) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	fmt.Printf(`Logged into app %q. Example curl command:
-
-%v
-`, app.Name, formatAppConfig(tc, profile, app.Name, app.PublicAddr, appFormatCURL))
-	return nil
+	return appLoginTpl.Execute(os.Stdout, map[string]string{
+		"appName": app.Name,
+		"curlCmd": formatAppConfig(tc, profile, app.Name, app.PublicAddr, appFormatCURL),
+	})
 }
+
+// appLoginTpl is the message that gets printed to a user upon successful app login.
+var appLoginTpl = template.Must(template.New("").Parse(
+	`Logged into app {{.appName}}. Example curl command:
+
+{{.curlCmd}}
+`))
 
 // getRegisteredApp returns the registered application with the specified name.
 func getRegisteredApp(cf *CLIConf, tc *client.TeleportClient) (app *types.App, err error) {

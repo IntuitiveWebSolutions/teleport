@@ -48,6 +48,11 @@ func (s *Server) CreateAppSession(ctx context.Context, req services.CreateAppSes
 
 	// Don't let the app session go longer than the identity expiration,
 	// which matches the parent web session TTL as well.
+	//
+	// When using web-based app access, the browser will send a cookie with
+	// sessionID which will be used to fetch services.WebSession which
+	// contains a certificate whose life matches the life of the session
+	// that will be used to establish the connection.
 	ttl := checker.AdjustSessionTTL(identity.Expires.Sub(s.clock.Now()))
 
 	// Create certificate for this session.

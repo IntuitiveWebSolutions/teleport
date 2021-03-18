@@ -525,12 +525,18 @@ func (a *Server) GenerateUserTestCerts(key []byte, username string, ttl time.Dur
 
 // AppTestCertRequest combines parameters for generating a test app access cert.
 type AppTestCertRequest struct {
-	PublicKey   []byte
-	Username    string
-	TTL         time.Duration
-	PublicAddr  string
+	// PublicKey is the public key to sign.
+	PublicKey []byte
+	// Username is the Teleport user name to sign certificate for.
+	Username string
+	// TTL is the test certificate validity period.
+	TTL time.Duration
+	// PublicAddr is the application public address. Used for routing.
+	PublicAddr string
+	// ClusterName is the name of the cluster application resides in. Used for routing.
 	ClusterName string
-	SessionID   string
+	// SessionID is the optional session ID to encode. Used for routing.
+	SessionID string
 }
 
 // GenerateUserAppTestCert generates an application specific certificate, used
